@@ -1,0 +1,20 @@
+# Evidence and personally identifying data - never commit these.
+Mobile_Exports/
+**/logical_evidence/
+**/disk_images/
+**/evidence_manifest.txt
+**/collection.log
+**/SHA256SUMS.txt
+**/Collection_Report.pdf
+*.dd
+*.dd.partial
+*.raw
+
+# Python and local application files.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+.env
+.DS_Store
