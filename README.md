@@ -20,7 +20,7 @@ An educational macOS application that prepares authorized file collections for r
 
 ## Requirements
 
-- macOS
+- macOS or windowsOS
 - Python 3.10 or later
 - Permission to collect the selected source
 - Download zip file first. 
