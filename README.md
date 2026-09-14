@@ -23,6 +23,7 @@ An educational macOS application that prepares authorized file collections for r
 - macOS
 - Python 3.10 or later
 - Permission to collect the selected source
+- Download zip file first. 
 
 Install the application dependencies:
 
