@@ -28,13 +28,21 @@ An educational macOS application that prepares authorized file collections for r
 Install the application dependencies:
 
 ```bash
+Mac
 python3 -m pip install -r requirements.txt
+Windows
+python -m pip install -r requirements.txt
+or
+py -m pip install -r requirements.txt
 ```
 
 ## Start the application
 
 ```bash
+Mac
 python3 -m streamlit run mac_to_autopsy_triage.py
+Windows
+python -m streamlit run mac_to_autopsy_triage.py
 ```
 
 Open the local address Streamlit displays in your browser.
