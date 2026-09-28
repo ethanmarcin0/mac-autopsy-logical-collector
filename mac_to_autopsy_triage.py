@@ -26,6 +26,7 @@ import streamlit as st
 
 
 APP_TITLE = "Digital Evidence Collector for Autopsy"
+APP_VERSION = "0.2.0"
 SCRIPT_DIR = Path(__file__).resolve().parent
 CHUNK_SIZE = 8 * 1024 * 1024
 DOCUMENT_EXTENSIONS = {".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".txt", ".rtf", ".csv"}
@@ -34,7 +35,16 @@ VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm"}
 BROWSER_DATABASES = {"history.db", "history", "places.sqlite"}
 ARTIFACT_OPTIONS = ["Documents", "Images", "Browser History Databases"]
 MOBILE_ARTIFACT_OPTIONS = ["Documents", "Photos", "Videos"]
-MOBILE_EXPORTS_DIR = SCRIPT_DIR / "Mobile_Exports"
+
+
+def default_output_root() -> Path:
+    """Keep case data outside a read-only packaged application bundle."""
+    if getattr(sys, "frozen", False):
+        return Path.home() / "Digital Evidence Collector"
+    return SCRIPT_DIR
+
+
+MOBILE_EXPORTS_DIR = default_output_root() / "Mobile_Exports"
 MOBILE_NO_BYPASS_STATEMENT = (
     "Owner-exported staging folder only; no live phone, cloud account, encrypted data, "
     "app-private data, passcode bypass, backup, developer mode, or security-control bypass was accessed."
@@ -102,19 +112,27 @@ def diskutil_info(target: str) -> dict[str, Any] | None:
     return plist_command(["/usr/sbin/diskutil", "info", "-plist", target])
 
 
-def output_disk_identifier() -> str | None:
-    info = diskutil_info(str(SCRIPT_DIR))
+def case_parent(metadata: dict[str, str]) -> Path:
+    requested = metadata.get("destination_parent")
+    parent = Path(requested).expanduser() if requested else default_output_root()
+    if not parent.is_absolute() or not parent.is_dir() or parent.is_symlink():
+        raise RuntimeError("Choose an existing, non-linked absolute destination folder.")
+    return parent.resolve()
+
+
+def output_disk_identifier(parent: Path | None = None) -> str | None:
+    info = diskutil_info(str(parent or default_output_root()))
     if not info:
         return None
     return str(info.get("ParentWholeDisk") or info.get("DeviceIdentifier") or "") or None
 
 
-def find_external_disks() -> list[Disk]:
+def find_external_disks(destination_parent: Path | None = None) -> list[Disk]:
     """List only external, physical, whole disks and exclude the output disk."""
     listing = plist_command(["/usr/sbin/diskutil", "list", "-plist"])
     if not listing:
         return []
-    excluded_disk = output_disk_identifier()
+    excluded_disk = output_disk_identifier(destination_parent)
     identifiers = listing.get("AllDisks", [])
     disks: list[Disk] = []
     for identifier in identifiers if isinstance(identifiers, list) else []:
@@ -155,9 +173,10 @@ def mounted_volumes() -> list[Path]:
 def mobile_exports_root() -> Path:
     """Return the private, project-local staging root for owner-exported files."""
     try:
+        MOBILE_EXPORTS_DIR.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         if MOBILE_EXPORTS_DIR.exists():
             if MOBILE_EXPORTS_DIR.is_symlink() or not MOBILE_EXPORTS_DIR.is_dir():
-                raise RuntimeError("Mobile_Exports must be a normal directory beside this script, not a link or file.")
+                raise RuntimeError("Mobile_Exports must be a normal directory in the app data folder, not a link or file.")
         else:
             MOBILE_EXPORTS_DIR.mkdir(mode=0o700)
         os.chmod(MOBILE_EXPORTS_DIR, 0o700)
@@ -493,24 +512,25 @@ def write_collection_report(
     return report_path
 
 
-def revalidate_external_disk(selected: Disk) -> Disk:
+def revalidate_external_disk(selected: Disk, destination_parent: Path | None = None) -> Disk:
     """Prevent a stale UI choice from being used after drives change."""
-    current = next((disk for disk in find_external_disks() if disk.identifier == selected.identifier), None)
+    current = next((disk for disk in find_external_disks(destination_parent) if disk.identifier == selected.identifier), None)
     if not current:
         raise RuntimeError("The selected external disk is no longer present or is no longer eligible.")
-    if current.device_node != selected.device_node or current.size != selected.size:
+    if (current.device_node != selected.device_node or current.size != selected.size
+            or current.name != selected.name or current.protocol != selected.protocol):
         raise RuntimeError("The selected disk changed after the scan. Scan again and reconfirm the source disk.")
     return current
 
 
 def create_case(destination_name: str, metadata: dict[str, str]) -> CaseWriter:
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    base = SCRIPT_DIR / f"{safe_folder_name(destination_name)}_{stamp}"
+    base = case_parent(metadata) / f"{safe_folder_name(destination_name)}_{stamp}"
     root = base
     suffix = 1
     while root.exists():
         suffix += 1
-        root = SCRIPT_DIR / f"{base.name}_{suffix}"
+        root = base.parent / f"{base.name}_{suffix}"
     return CaseWriter(root, metadata)
 
 
@@ -537,6 +557,8 @@ def collect_directory(
     report(f"Case folder created: {writer.root}")
 
     def event(message: str) -> None:
+        if message.startswith("SCAN ERROR:"):
+            counts["errors"] += 1
         writer.log(message)
         report(message)
 
@@ -612,8 +634,16 @@ def collect_logical(
     metadata: dict[str, str],
     report: Callable[[str], None],
 ) -> tuple[Path, dict[str, int]]:
-    if not source.is_dir() or source.parent != Path("/Volumes"):
+    if source.is_symlink() or not source.is_dir() or source.parent != Path("/Volumes"):
         raise RuntimeError("The selected source volume is no longer an eligible mounted volume under /Volumes.")
+    destination = case_parent(metadata)
+    source_info = diskutil_info(str(source))
+    output_info = diskutil_info(str(destination))
+    if source_info and output_info:
+        source_disk = source_info.get("ParentWholeDisk") or source_info.get("DeviceIdentifier")
+        output_disk = output_info.get("ParentWholeDisk") or output_info.get("DeviceIdentifier")
+        if source_disk and source_disk == output_disk:
+            raise RuntimeError("The case destination is on the source volume's disk. Choose a different destination.")
     return collect_directory(
         source,
         selected,
@@ -675,18 +705,71 @@ def is_fat_family(filesystem: str) -> bool:
     return filesystem.lower() in {"msdos", "fat", "fat32", "vfat"}
 
 
+def ewf_tool(name: str) -> str | None:
+    """Find a separately installed libewf utility in CLI or packaged-app PATHs."""
+    found = shutil.which(name)
+    if found:
+        return found
+    for directory in (Path("/opt/homebrew/bin"), Path("/usr/local/bin")):
+        candidate = directory / name
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    return None
+
+
+def validate_disk_destination(disk: Disk, parent: Path, image_format: str) -> None:
+    """Fail closed when the output media cannot be distinguished from the source."""
+    output_id = output_disk_identifier(parent)
+    if not output_id:
+        raise RuntimeError("Cannot identify the destination disk. Choose another folder and scan again.")
+    if output_id == disk.identifier:
+        raise RuntimeError("The destination is on the selected source disk. Choose a different disk.")
+    free_space = shutil.disk_usage(parent).free
+    # E01 compression varies with source data; reserve capacity for the full stream.
+    if free_space < disk.size:
+        raise RuntimeError(
+            f"Insufficient destination space: {format_bytes(free_space)} available; "
+            f"at least {format_bytes(disk.size)} required."
+        )
+    output_info = diskutil_info(str(parent)) or {}
+    if image_format == "raw" and is_fat_family(str(output_info.get("FilesystemType") or "")) and disk.size > 4 * 1024**3:
+        raise RuntimeError("A FAT-family destination cannot hold a raw image larger than 4 GiB.")
+    if image_format == "e01" and not all(ewf_tool(name) for name in ("ewfacquirestream", "ewfverify")):
+        raise RuntimeError("E01 requires libewf. Install it on this Mac with: brew install libewf")
+
+
 def image_disk(
     disk: Disk,
     destination_name: str,
     metadata: dict[str, str],
     report: Callable[[str], None],
     progress: Callable[[float], None],
+    image_format: str = "raw",
 ) -> tuple[Path, str]:
-    """Copy an approved raw source stream to a partial image and verify it."""
-    disk = revalidate_external_disk(disk)
+    """Acquire the selected physical disk to raw DD or E01 and verify output."""
+    if image_format not in {"raw", "e01"}:
+        raise RuntimeError("Select Raw DD or E01 before imaging.")
+    parent = case_parent(metadata)
+    disk = revalidate_external_disk(disk, parent)
+    validate_disk_destination(disk, parent, image_format)
+    if (not metadata.get("evidence_number", "").strip()
+            or not metadata.get("source_serial_label", "").strip()
+            or not metadata.get("write_blocker", "").strip()
+            or metadata.get("write_blocker_confirmed") != "yes"):
+        raise RuntimeError("Evidence ID, drive serial or asset tag, and confirmed write-blocker details are required.")
+    authorized, detail = sudo_available()
+    if not authorized:
+        raise RuntimeError(
+            "Disk access is not authorized in this Terminal session. Launch the Terminal helper, "
+            "or run sudo -v before starting Streamlit from the same Terminal. " + detail
+        )
     writer = create_case(destination_name, metadata | {
-        "collection_mode": "raw_disk_image", "source_disk": disk.identifier, "source_device_node": disk.device_node,
+        "collection_mode": "physical_disk_image", "image_format": image_format,
+        "source_disk": disk.identifier, "source_device_node": disk.device_node,
         "source_size_bytes": str(disk.size), "source_media_name": disk.name,
+        "source_protocol": disk.protocol, "source_filesystem": disk.filesystem,
+        "source_serial_reported": str(disk.raw_info.get("SerialNumber") or disk.raw_info.get("DeviceSerialNumber") or "unavailable"),
+        "application_version": APP_VERSION,
     })
     image_dir = writer.root / "disk_images"
     image_dir.mkdir()
@@ -696,27 +779,9 @@ def image_disk(
         writer.log(message)
         report(message)
 
-    free_space = shutil.disk_usage(writer.root).free
-    if free_space < disk.size:
-        reason = f"Insufficient destination space: {format_bytes(free_space)} available; {format_bytes(disk.size)} required."
-        writer.record("DISK IMAGE — PRECHECK FAILED", {"timestamp_utc": utc_now(), "reason": reason})
-        event(reason)
-        raise RuntimeError(reason)
-    output_info = diskutil_info(str(writer.root)) or {}
-    output_filesystem = str(output_info.get("FilesystemType") or "")
-    if is_fat_family(output_filesystem) and disk.size > 4 * 1024**3:
-        reason = "The destination filesystem is FAT-family and cannot safely store this image larger than 4 GiB."
-        writer.record("DISK IMAGE — PRECHECK FAILED", {"timestamp_utc": utc_now(), "reason": reason})
-        event(reason)
-        raise RuntimeError(reason)
-    authorized, detail = sudo_available()
-    if not authorized:
-        reason = "Noninteractive sudo authorization is unavailable. In the same terminal, run: sudo -v && python3 -m streamlit run mac_to_autopsy_triage.py"
-        writer.record("DISK IMAGE — PRECHECK FAILED", {"timestamp_utc": utc_now(), "reason": reason, "sudo_detail": detail})
-        event(reason)
-        raise RuntimeError(reason)
-
     raw_node = disk.device_node.replace("/dev/disk", "/dev/rdisk", 1)
+    if image_format == "e01":
+        return acquire_e01(disk, raw_node, writer, metadata, event, report, progress)
     partial = image_dir / f"{disk.identifier}_raw.dd.partial"
     final = image_dir / f"{disk.identifier}_raw.dd"
     source_digest = hashlib.sha256()
@@ -760,12 +825,126 @@ def image_disk(
     progress(1.0)
     writer.record("DISK IMAGE — VERIFIED", {
         "completed_utc": utc_now(), "source_disk": disk.identifier, "source_device_node": raw_node,
-        "destination_image": final, "size_bytes": copied, "sha256": stream_hash, "copy_verified": "yes",
+        "destination_image": final, "size_bytes": copied,
+        "acquisition_stream_sha256": stream_hash, "stored_image_sha256": output_hash,
+        "verification_method": "SHA-256 of acquisition stream compared with independent read of stored DD file",
+        "copy_verified": "yes",
     })
     event(f"DISK IMAGE VERIFIED: {final} | SHA-256: {stream_hash}")
-    inventory = finalize_case(writer, {"collection_mode": "raw_disk_image", "image_sha256": stream_hash, "image_size_bytes": copied})
+    inventory = finalize_case(writer, {"collection_mode": "raw_disk_image", "image_sha256": output_hash, "image_size_bytes": copied})
     report(f"CHECKSUM INVENTORY WRITTEN: {inventory}")
     return writer.root, stream_hash
+
+
+def acquire_e01(
+    disk: Disk,
+    raw_node: str,
+    writer: CaseWriter,
+    metadata: dict[str, str],
+    event: Callable[[str], None],
+    report: Callable[[str], None],
+    progress: Callable[[float], None],
+) -> tuple[Path, str]:
+    """Stream readable sectors into libewf, then independently verify E01 segments."""
+    acquire_tool = ewf_tool("ewfacquirestream")
+    verify_tool = ewf_tool("ewfverify")
+    if not acquire_tool or not verify_tool:
+        raise RuntimeError("E01 requires the libewf acquisition and verification tools.")
+    image_dir = writer.root / "disk_images"
+    pending = image_dir / "incomplete"
+    pending.mkdir(mode=0o700)
+    target = pending / f"{disk.identifier}_image"
+    acquire_log = writer.root / "ewfacquire.log"
+    verify_log = writer.root / "ewfverify.log"
+    tool_version = subprocess.run([acquire_tool, "-V"], capture_output=True, text=True, check=False, timeout=10)
+    writer.record("E01 TOOL", {"path": acquire_tool, "version": (tool_version.stdout + tool_version.stderr).strip()})
+    command = [
+        acquire_tool, "-q", "-B", str(disk.size), "-d", "sha256", "-c", "fast",
+        "-f", "encase6", "-C", metadata["case_id"], "-D", metadata.get("evidence_description", "Disk acquisition"),
+        "-e", metadata["examiner"], "-E", metadata["evidence_number"],
+        "-l", str(acquire_log), "-t", str(target),
+    ]
+    source_command = ["/usr/bin/sudo", "-n", "/bin/dd", f"if={raw_node}", "bs=4m"]
+    writer.record("E01 ACQUISITION — START", {
+        "timestamp_utc": utc_now(), "source_device": raw_node, "expected_bytes": disk.size,
+        "tool": acquire_tool, "format": "encase6", "compression": "fast", "digest": "sha256",
+        "incomplete_output": pending,
+    })
+    event(f"E01 ACQUISITION START | source={raw_node} | expected_bytes={disk.size}")
+    source_digest = hashlib.sha256()
+    copied = 0
+    source: subprocess.Popen[bytes] | None = None
+    sink: subprocess.Popen[bytes] | None = None
+    stderr_file = writer.root / "ewfacquire_stderr.log"
+    try:
+        with stderr_file.open("wb") as stderr_handle:
+            source = subprocess.Popen(source_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            sink = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=stderr_handle)
+            assert source.stdout is not None and sink.stdin is not None
+            while block := source.stdout.read(CHUNK_SIZE):
+                sink.stdin.write(block)
+                source_digest.update(block)
+                copied += len(block)
+                progress(min(copied / disk.size, 1.0) if disk.size else 0.0)
+            sink.stdin.close()
+            source_error = source.stderr.read().decode("utf-8", errors="replace") if source.stderr else ""
+            source_exit = source.wait()
+            sink_exit = sink.wait()
+        if source_exit != 0 or sink_exit != 0 or copied != disk.size:
+            raise RuntimeError(
+                f"E01 acquisition incomplete (reader exit={source_exit}, E01 exit={sink_exit}, "
+                f"bytes={copied}, expected={disk.size}). {source_error.strip()}"
+            )
+        first_segment = target.with_suffix(".E01")
+        if not first_segment.is_file():
+            raise RuntimeError("The E01 tool completed without producing its first segment.")
+        event("Verifying E01 segments with ewfverify...")
+        verified = subprocess.run(
+            [verify_tool, "-q", "-d", "sha256", "-l", str(verify_log), str(first_segment)],
+            capture_output=True, text=True, check=False,
+        )
+        if verified.returncode != 0:
+            raise RuntimeError("E01 verification failed: " + (verified.stderr or verified.stdout).strip())
+        verification_text = verified.stdout + "\n" + verified.stderr
+        if verify_log.is_file():
+            verification_text += "\n" + verify_log.read_text(encoding="utf-8", errors="replace")
+        matches = re.findall(r"SHA256 hash calculated over data:\s*([0-9a-f]{64})", verification_text, re.IGNORECASE)
+        if not matches or any(value.lower() != source_digest.hexdigest() for value in matches):
+            raise RuntimeError("E01 verification did not confirm a SHA-256 matching the acquisition stream.")
+        segments = sorted(pending.glob(f"{target.name}.E*"))
+        if not segments:
+            raise RuntimeError("No verified E01 segments were found.")
+        for segment in segments:
+            segment.rename(image_dir / segment.name)
+        pending.rmdir()
+        stream_hash = source_digest.hexdigest()
+        writer.record("E01 ACQUISITION — VERIFIED", {
+            "completed_utc": utc_now(), "source_device": raw_node, "bytes_read": copied,
+            "acquisition_stream_sha256": stream_hash, "verified_image_data_sha256": matches[0].lower(),
+            "verification_method": "libewf ewfverify SHA-256 compared with the acquisition-stream SHA-256",
+            "first_segment": image_dir / first_segment.name, "segment_count": len(segments),
+            "acquisition_log": acquire_log, "verification_log": verify_log,
+        })
+        event(f"E01 VERIFIED: {len(segments)} segment(s) | acquisition stream SHA-256: {stream_hash}")
+        progress(1.0)
+        inventory = finalize_case(writer, {"collection_mode": "e01_disk_image", "acquisition_stream_sha256": stream_hash, "image_size_bytes": copied})
+        report(f"CHECKSUM INVENTORY WRITTEN: {inventory}")
+        return writer.root, stream_hash
+    except BaseException as exc:
+        for process in (source, sink):
+            if process is not None and process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+        writer.record("E01 ACQUISITION — FAILED", {
+            "timestamp_utc": utc_now(), "bytes_read": copied, "expected_bytes": disk.size,
+            "incomplete_output": pending, "error": repr(exc),
+        })
+        event(f"E01 ACQUISITION FAILED; incomplete files retained in {pending}: {exc}")
+        raise
 
 
 def ui_reporter(placeholder: Any) -> Callable[[str], None]:
@@ -780,38 +959,94 @@ def ui_reporter(placeholder: Any) -> Callable[[str], None]:
     return report
 
 
-def render_landing_page() -> None:
-    st.header("Overview and Instructions")
-    st.warning("Authorized use only. Do not use this software on media you do not own or lack documented authority to examine.")
-    st.markdown(f"""
-### What this tool does
+def apply_visual_theme() -> None:
+    """Apply a readable purple, retro-terminal visual treatment to the UI."""
+    st.markdown(
+        """
+        <style>
+        :root { --ink:#f5f0ff; --muted:#c9bddf; --panel:#20162e; --border:#4b326d; --purple:#a855f7; --bright:#d8b4fe; --mint:#72f1c4; }
+        .stApp { background:radial-gradient(circle at 88% 3%,rgba(168,85,247,.24),transparent 27rem),radial-gradient(circle at 8% 20%,rgba(114,241,196,.10),transparent 24rem),#100b19; color:var(--ink); }
+        [data-testid="stHeader"] { background:rgba(16,11,25,.76); }
+        [data-testid="stSidebar"] { background:linear-gradient(180deg,#1c1229,#100b19); border-right:1px solid var(--border); }
+        [data-testid="stSidebar"] * { color:var(--ink); }
+        .stApp h1,.stApp h2,.stApp h3 { color:#fff8ff; letter-spacing:-.02em; }
+        .stApp p,.stApp li,.stApp label,.stApp .stCaption { color:var(--muted); }
+        div[data-baseweb="tab-list"] { gap:.35rem; border-bottom:1px solid var(--border); }
+        button[data-baseweb="tab"] { color:var(--muted)!important; border-radius:.45rem .45rem 0 0; font-weight:650; }
+        button[data-baseweb="tab"][aria-selected="true"] { color:var(--bright)!important; border-bottom:3px solid var(--purple)!important; background:rgba(168,85,247,.11); }
+        .stButton > button { background:linear-gradient(135deg,#8b3de0,#6d28d9); border:1px solid #d8b4fe; color:white; box-shadow:3px 3px 0 #31124d; font-weight:700; }
+        .stButton > button:hover { background:linear-gradient(135deg,#a855f7,#7c3aed); border-color:#f0d9ff; }
+        div[data-testid="stTextInput"] input,div[data-baseweb="select"] > div { background:rgba(32,22,46,.92)!important; border-color:#72508d!important; color:var(--ink)!important; }
+        .hero-panel { position:relative; overflow:hidden; padding:2.1rem 2.25rem; margin:.45rem 0 1.1rem; border:1px solid #8750b7; border-radius:1rem; background:linear-gradient(120deg,rgba(49,26,72,.98),rgba(25,16,39,.98)); box-shadow:8px 8px 0 rgba(79,34,113,.42); }
+        .hero-panel::after { content:""; position:absolute; width:16rem; height:16rem; right:-5rem; top:-9rem; border:1px solid rgba(216,180,254,.36); border-radius:50%; box-shadow:0 0 0 1.5rem rgba(168,85,247,.07),0 0 0 3.1rem rgba(168,85,247,.04); }
+        .eyebrow { color:var(--mint)!important; font:800 .78rem ui-monospace,SFMono-Regular,Menlo,monospace; letter-spacing:.13em; text-transform:uppercase; margin:0 0 .7rem; }
+        .hero-panel h1 { margin:0; font-size:clamp(2rem,5vw,3.7rem); line-height:1.02; }
+        .hero-panel h1 span { color:var(--bright); }
+        .hero-copy { max-width:48rem; font-size:1.08rem; line-height:1.6; margin:1rem 0 0; color:#e6daef!important; }
+        .status-line { display:inline-block; margin-top:1.15rem; padding:.42rem .7rem; color:#b9ffe6!important; border:1px solid rgba(114,241,196,.42); border-radius:99px; font:700 .78rem ui-monospace,SFMono-Regular,Menlo,monospace; }
+        .workflow-grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:.85rem; margin:.8rem 0 1.2rem; }
+        .workflow-card { min-height:11rem; padding:1.1rem; border:1px solid var(--border); border-radius:.8rem; background:rgba(32,22,46,.86); }
+        .workflow-number { display:inline-flex; align-items:center; justify-content:center; width:2rem; height:2rem; margin-bottom:.75rem; border:1px solid var(--bright); border-radius:.3rem; color:var(--bright); font:800 .9rem ui-monospace,SFMono-Regular,Menlo,monospace; }
+        .workflow-card h3 { margin:0 0 .4rem; font-size:1rem; }
+        .workflow-card p { margin:0; line-height:1.45; }
+        .boundary-card { padding:1rem 1.15rem; border-left:4px solid var(--mint); border-radius:0 .6rem .6rem 0; background:rgba(114,241,196,.08); color:#dcfff2!important; }
+        .retro-rule { height:1px; margin:1.7rem 0; border:0; background:linear-gradient(90deg,var(--purple),transparent); }
+        @media (max-width:700px) { .hero-panel { padding:1.5rem; box-shadow:4px 4px 0 rgba(79,34,113,.42); } .workflow-grid { grid-template-columns:1fr; } }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
-**USB / Drive File Collection** copies selected user files (including photos) from one already-mounted external volume.  
-**Raw Disk Image (advanced)** makes a sector-by-sector `.dd` image of one approved external physical disk for examination in Autopsy.
-**Owner-Exported Mobile Files** copies only owner-exported documents, photos, and videos from the private `{MOBILE_EXPORTS_DIR.name}` staging folder.
+
+def render_landing_page() -> None:
+    mobile_exports_name = escape(MOBILE_EXPORTS_DIR.name)
+    st.markdown(
+        """<section class="hero-panel"><p class="eyebrow">Mac → Autopsy / Evidence acquisition console</p><h1>Collect with care.<br><span>Examine with confidence.</span></h1><p class="hero-copy">A focused classroom workflow for authorized logical collections and verified physical disk images—built to hand documented evidence to Autopsy.</p><span class="status-line">● AUTHORITY + INTEGRITY + DOCUMENTATION</span></section>""",
+        unsafe_allow_html=True,
+    )
+    st.markdown("### Your workflow")
+    st.markdown(
+        """<div class="workflow-grid"><article class="workflow-card"><span class="workflow-number">01</span><h3>Document authority</h3><p>Enter the case number, examiner, and authority basis in the case controls before collection unlocks.</p></article><article class="workflow-card"><span class="workflow-number">02</span><h3>Acquire the right scope</h3><p>Collect selected logical files, owner-exported mobile files, or a physical image of an approved external disk.</p></article><article class="workflow-card"><span class="workflow-number">03</span><h3>Verify &amp; examine</h3><p>Keep the manifest, log, and SHA-256 inventory, then import the evidence into Autopsy.</p></article></div><div class="boundary-card"><strong>Authorized use only.</strong> Do not use this software on media you do not own or lack documented authority to examine.</div><hr class="retro-rule">""",
+        unsafe_allow_html=True,
+    )
+    st.markdown(f"""
+### Collection modes
+
+- **USB / Drive File Collection** — copies selected accessible files from one already-mounted external volume. It does not recover deleted data.
+- **Physical Disk Image** — acquires one approved external physical disk to raw `.dd`, or E01 when `libewf` is installed. A tested hardware write blocker is required.
+- **Owner-Exported Mobile Files** — copies only documents, photos, and videos the owner places in `{mobile_exports_name}/[export-name]` in the app data folder.
 
 It does **not** unlock phones, defeat encryption, bypass access controls, recover cloud data, create phone backups, use developer mode, access app-private data, or image this Mac's startup disk.
 
 ### Before collecting
 
-1. Obtain and document legal/organizational authority, the case ID, and examiner identity.
-2. For evidentiary media, attach the source through a hardware write blocker whenever possible. A mounted drive may already have been changed if it was attached without one.
-3. Keep enough free space beside this script for the output. Disk images require at least the source disk's full capacity.
-4. Install Streamlit once: `python3 -m pip install streamlit`.
-5. Start the app: `python3 -m streamlit run mac_to_autopsy_triage.py`.
+1. Document authority, the case ID, and examiner identity.
+2. Choose an existing case output location on a disk separate from the source. Disk images require at least the source disk's full capacity free.
+3. For physical imaging, validate your write blocker with sacrificial media first and record its read-only status. A source may already have changed if connected without one.
+4. Start the app from source with `python3 -m streamlit run mac_to_autopsy_triage.py`, or use the packaged macOS app.
 
 For raw imaging, authorize the narrowly used system reader in the same Terminal first, then launch the app normally:
 
 `sudo -v && python3 -m streamlit run mac_to_autopsy_triage.py`
 
-The app never accepts or stores a password and never runs a source-writing command.
+The app never accepts or stores a password and never runs a source-writing command. For the packaged app, use the included Terminal imaging launcher to establish the same-session `sudo` authorization. E01 additionally requires `brew install libewf`.
+
+### Physical disk acquisition checklist
+
+1. Record the evidence item ID, source serial/asset tag, description, examiner, authority, write blocker make/model, and blocker serial if present.
+2. Attach the approved physical source through a tested hardware write blocker. Select the whole external disk, confirm its displayed size and identifier, and choose raw DD or E01.
+3. Confirm a separate destination disk with enough free space; type the source disk identifier and affirm the write-blocker status.
+4. Acquire. A read error, short read, or failed verification leaves clearly marked incomplete output; do not treat it as a verified image.
+5. Retain the case log, manifest, and checksum inventory. Raw DD compares the acquisition-stream SHA-256 with an independent read of the saved image. E01 is checked using `ewfverify` and records the source-stream SHA-256.
+
+This workflow aligns with common forensic acquisition controls, but the program and a specific hardware setup still require validation before evidentiary use. Source media, enclosure, write blocker, and destination must be documented outside the app as needed for your lab's chain of custody.
 
 ### Owner-Exported Mobile Files
 
 This feature simulates a complete collection of the **owner-approved exported file set**. It is not a physical phone image and cannot recover deleted, encrypted, cloud, message, call-log, browser, or app-private data.
 
 1. Use only an owner-approved, unlocked test phone.
-2. The owner manually exports selected documents, photos, and videos to `{MOBILE_EXPORTS_DIR.name}/<export-name>` beside this script.
+2. The owner manually exports selected documents, photos, and videos to `{mobile_exports_name}/[export-name]` in the app data folder shown on the mobile tab.
 3. Do not connect this app directly to a phone or enable developer mode, device backup, account access, or security-bypass features.
 4. Enter the case information, then open **Owner-Exported Mobile Files**.
 5. Select the matching export folder and artifact categories.
@@ -823,7 +1058,7 @@ This feature simulates a complete collection of the **owner-approved exported fi
 
 1. Create or open an Autopsy case and choose **Add Data Source**.
 2. For a USB / Drive File Collection or Owner-Exported Mobile Files collection, choose **Logical Files** and select the completed `logical_evidence` folder.
-3. For a full image, choose **Image File** and select the verified `.dd` file in `disk_images`.
+3. For a physical image, choose **Image File** and select the verified `.dd` or first `.E01` segment in `disk_images`.
 4. Retain `evidence_manifest.txt` and `collection.log` as your integrity and chain-of-custody records. Use the manifest as the source of original timestamps for logical copies.
 """)
 
@@ -848,7 +1083,10 @@ def render_logical_tab(authorized: bool, destination_name: str, base_metadata: d
         try:
             with st.spinner("Collecting and verifying selected artifacts..."):
                 case_root, counts = collect_logical(Path(source_text), set(choices), destination_name, base_metadata, reporter)
-            st.success(f"Verified file collection complete: {counts['copied']} copied, {counts['errors']} errors.")
+            if counts["errors"]:
+                st.warning(f"Collection finished with errors: {counts['copied']} copied, {counts['errors']} errors. Review collection.log before using this case.")
+            else:
+                st.success(f"Verified file collection complete: {counts['copied']} copied, 0 errors.")
             st.code(str(case_root), language="text")
         except Exception as exc:
             st.error(f"Logical collection stopped: {exc}")
@@ -912,60 +1150,95 @@ def render_mobile_tab(authorized: bool, destination_name: str, base_metadata: di
         try:
             with st.spinner("Collecting and verifying owner-exported mobile files..."):
                 case_root, counts = collect_mobile_logical(source, set(choices), destination_name, base_metadata, reporter)
-            st.success(f"Mobile evidence collection complete: {counts['copied']} copied, {counts['errors']} errors.")
+            if counts["errors"]:
+                st.warning(f"Mobile import finished with errors: {counts['copied']} copied, {counts['errors']} errors. Review collection.log before using this case.")
+            else:
+                st.success(f"Mobile evidence collection complete: {counts['copied']} copied, 0 errors.")
             st.code(str(case_root), language="text")
         except Exception as exc:
             st.error(f"Mobile logical import stopped: {exc}")
 
 
 def render_image_tab(authorized: bool, destination_name: str, base_metadata: dict[str, str]) -> None:
-    st.header("Raw Disk Image (Advanced)")
-    st.error("This mode reads an entire external physical disk. Use only with documented authority and preferably a hardware write blocker.")
+    st.header("Physical Disk Image")
+    st.warning("This mode reads an entire external physical disk. Connect the approved source through a tested hardware write blocker.")
     if st.button("Scan for Eligible External Disks", key="scan_disks"):
-        st.session_state.disks = find_external_disks()
+        try:
+            st.session_state.disks = find_external_disks(case_parent(base_metadata))
+        except RuntimeError as exc:
+            st.error(str(exc))
+            return
     disks: list[Disk] = st.session_state.get("disks", [])
     if not disks:
-        st.info("Click “Scan for Eligible External Disks”. Internal disks and the disk holding this app are excluded.")
+        st.info("Click “Scan for Eligible External Disks”. Internal disks and the disk holding the selected case destination are excluded.")
         return
     selected_id = st.selectbox("External physical source disk", [""] + [disk.identifier for disk in disks], format_func=lambda item: "Select an external disk" if not item else next(disk.label for disk in disks if disk.identifier == item), key="image_source")
     if not selected_id:
         return
     disk = next(item for item in disks if item.identifier == selected_id)
-    st.write(f"Selected source: `{disk.device_node}` — {format_bytes(disk.size)}")
-    st.caption("The destination is a new timestamped case folder beside this script. The source will not be mounted, unmounted, formatted, repaired, or written by this app.")
+    image_format = st.selectbox("Image format", ["raw", "e01"], format_func=lambda value: "Raw DD (.dd)" if value == "raw" else "E01 (compressed forensic container)", key="image_format")
+    if image_format == "e01" and not all(ewf_tool(name) for name in ("ewfacquirestream", "ewfverify")):
+        st.info("E01 requires libewf on this Mac: brew install libewf")
+    evidence_number = st.text_input("Evidence item number", key="evidence_number")
+    source_serial = st.text_input("Drive serial number or asset tag", key="source_serial_label")
+    description = st.text_input("Evidence description", key="evidence_description")
+    blocker = st.text_input("Write blocker make and model", key="write_blocker")
+    blocker_serial = st.text_input("Write blocker serial number (if labeled)", key="write_blocker_serial")
+    blocker_confirmed = st.checkbox("I verified the source is connected through the hardware write blocker and recorded its read-only status.", key="write_blocker_confirmed")
+    st.markdown(
+        f"**Source:** `{disk.device_node}` · {disk.name} · {format_bytes(disk.size)} · {disk.protocol or 'external'}  \n"
+        f"**Destination parent:** `{base_metadata['destination_parent']}`  \n"
+        f"**Format:** {'Raw DD' if image_format == 'raw' else 'E01'}"
+    )
+    st.caption("The source will not be mounted, unmounted, formatted, repaired, or written by this app. Any read error stops the acquisition and leaves the incomplete output clearly marked.")
     typed_disk = st.text_input(f"Type {disk.identifier} to confirm the physical source disk", key="typed_disk")
     console = st.empty()
-    if st.button("Create Verified Disk Image", type="primary", disabled=not authorized or typed_disk != disk.identifier, key="image_execute"):
+    ready = all((authorized, typed_disk == disk.identifier, evidence_number.strip(), source_serial.strip(), blocker.strip(), blocker_confirmed))
+    if st.button("Create and Verify Disk Image", type="primary", disabled=not ready, key="image_execute"):
         st.session_state.live_logs = []
         reporter = ui_reporter(console)
         status = st.progress(0.0)
+        acquisition_metadata = base_metadata | {
+            "evidence_number": evidence_number.strip(),
+            "source_serial_label": source_serial.strip(),
+            "evidence_description": description.strip(),
+            "write_blocker": blocker.strip(),
+            "write_blocker_serial": blocker_serial.strip() or "not recorded",
+            "write_blocker_confirmed": "yes",
+        }
         try:
             with st.spinner("Imaging the approved external disk. Do not disconnect it."):
-                case_root, image_hash = image_disk(disk, destination_name, base_metadata, reporter, status.progress)
-            st.success("Disk image completed and SHA-256 verified.")
-            st.code(f"Case folder: {case_root}\nSHA-256: {image_hash}", language="text")
+                case_root, image_hash = image_disk(disk, destination_name, acquisition_metadata, reporter, status.progress, image_format)
+            st.success("Disk image completed and verified.")
+            st.code(f"Case folder: {case_root}\nAcquisition stream SHA-256: {image_hash}", language="text")
         except Exception as exc:
             st.error(f"Disk imaging did not complete: {exc}")
 
 
 def main() -> None:
     st.set_page_config(page_title=APP_TITLE, page_icon="🔎", layout="wide")
+    apply_visual_theme()
     st.title(APP_TITLE)
     st.caption("Authorized collection and integrity verification for files you will examine in Autopsy.")
+    if getattr(sys, "frozen", False):
+        default_output_root().mkdir(parents=True, mode=0o700, exist_ok=True)
     with st.sidebar:
         st.subheader("Case Information")
-        destination_name = st.text_input("Output Case Folder", value="Forensic_Triage_Output")
         case_id = st.text_input("Case Number")
+        st.caption("Case folders use the case number followed by a UTC timestamp.")
         examiner = st.text_input("Collector / Examiner")
         authority = st.text_input("Authority to Collect (owner, written consent, warrant, institutional authorization)")
+        destination_parent = st.text_input("Case output location (existing folder)", value=str(default_output_root()))
         authorized = st.checkbox("I have documented authority to examine this source and understand this tool's limits.")
         if not authorized:
             st.info("Collection controls unlock after documented-authority acknowledgment.")
         elif not (case_id.strip() and examiner.strip() and authority.strip()):
             authorized = False
             st.warning("Case ID, examiner name, and authority basis are required before collection.")
-    base_metadata = {"case_id": case_id.strip(), "examiner": examiner.strip(), "authority_basis": authority.strip(), "application": APP_TITLE, "python": sys.version.split()[0]}
-    landing, logical, mobile, image = st.tabs(["Overview & Instructions", "USB / Drive Files", "Owner-Exported Mobile Files", "Raw Disk Image (Advanced)"])
+    case_id = case_id.strip()
+    destination_name = case_id or "Forensic_Triage_Output"
+    base_metadata = {"case_id": case_id, "examiner": examiner.strip(), "authority_basis": authority.strip(), "destination_parent": destination_parent.strip(), "application": APP_TITLE, "application_version": APP_VERSION, "python": sys.version.split()[0]}
+    landing, logical, mobile, image = st.tabs(["Overview & Instructions", "USB / Drive Files", "Owner-Exported Mobile Files", "Physical Disk Image"])
     with landing:
         render_landing_page()
     with logical:

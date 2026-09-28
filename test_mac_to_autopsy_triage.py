@@ -6,6 +6,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import mac_to_autopsy_triage as app
 
@@ -128,6 +129,62 @@ class MobileLogicalImportTests(unittest.TestCase):
         (outside / "photo.jpeg").write_bytes(b"photo")
         with self.assertRaisesRegex(RuntimeError, "Mobile_Exports"):
             app.collect_mobile_logical(outside, {"Photos"}, "MOBILE-TEST", {}, lambda _: None)
+
+    def test_repeated_case_name_stays_in_selected_output_folder(self) -> None:
+        output = self.root / "cases"
+        output.mkdir()
+        metadata = {"destination_parent": str(output)}
+        first = app.create_case("CASE-1", metadata)
+        second = app.create_case("CASE-1", metadata)
+        self.assertEqual(first.root.parent, output.resolve())
+        self.assertEqual(second.root.parent, output.resolve())
+        self.assertNotEqual(first.root, second.root)
+
+    def test_scan_failure_is_counted_not_reported_as_zero_errors(self) -> None:
+        source = self.make_export()
+        (source / "photo.jpeg").write_bytes(b"photo")
+
+        def failed_scan(_source, _selected, _excluded, log, _classifier):
+            log("SCAN ERROR: permission denied")
+            return iter(())
+
+        with patch.object(app, "artifact_paths", side_effect=failed_scan):
+            case_root, counts = app.collect_mobile_logical(
+                source, {"Photos"}, "CASE-2",
+                {"case_id": "CASE-2", "examiner": "Tester", "authority_basis": "owner"},
+                lambda _: None,
+            )
+        self.assertEqual(counts["errors"], 1)
+        self.assertIn("SCAN ERROR", (case_root / "collection.log").read_text())
+
+
+class PhysicalImagingSafetyTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tempdir.cleanup)
+        self.destination = Path(self.tempdir.name)
+        self.disk = app.Disk("disk9", "/dev/disk9", 1024, "Test disk", "USB", "", {})
+
+    def test_destination_must_be_identifiable_and_separate(self) -> None:
+        with patch.object(app, "output_disk_identifier", return_value=None):
+            with self.assertRaisesRegex(RuntimeError, "Cannot identify"):
+                app.validate_disk_destination(self.disk, self.destination, "raw")
+        with patch.object(app, "output_disk_identifier", return_value="disk9"):
+            with self.assertRaisesRegex(RuntimeError, "source disk"):
+                app.validate_disk_destination(self.disk, self.destination, "raw")
+
+    def test_e01_requires_both_acquisition_and_verification_tools(self) -> None:
+        with patch.object(app, "output_disk_identifier", return_value="disk1"), \
+                patch.object(app, "diskutil_info", return_value={}), \
+                patch.object(app, "ewf_tool", return_value=None):
+            with self.assertRaisesRegex(RuntimeError, "libewf"):
+                app.validate_disk_destination(self.disk, self.destination, "e01")
+
+    def test_revalidation_rejects_changed_device_identity(self) -> None:
+        changed = app.Disk("disk9", "/dev/disk9", 1024, "Different disk", "USB", "", {})
+        with patch.object(app, "find_external_disks", return_value=[changed]):
+            with self.assertRaisesRegex(RuntimeError, "changed"):
+                app.revalidate_external_disk(self.disk, self.destination)
 
 
 if __name__ == "__main__":
