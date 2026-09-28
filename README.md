@@ -21,11 +21,13 @@ An educational macOS application that prepares authorized logical file collectio
 
 ## Requirements
 
-- macOS
+- macOS (Apple Silicon for the current downloadable app)
 - Python 3.10 or later
 - Permission to collect the selected source
 - A tested hardware write blocker for physical disk imaging
 - Optional: `libewf` (`brew install libewf`) for E01 acquisition and verification
+
+If you download GitHub's source ZIP, extract it before running the commands below. Windows can install the Python dependencies with `py -m pip install -r requirements.txt`, but collection and disk imaging in this version depend on macOS `diskutil` and `/Volumes`; Windows execution is not supported.
 
 Install the application dependencies:
 
